@@ -34,9 +34,12 @@ MirvInstanceBackend_D12::MirvInstanceBackend_D12(IDXGIFactory1* const factory)
 
 MirvInstanceBackend_D12::~MirvInstanceBackend_D12() = default;
 
-const std::vector<rp<MirvPhysicalDevice>>
+std::vector<VkPhysicalDevice>
 MirvInstanceBackend_D12::EnumeratePhysicalDevices()
 {
+    if (mPhysDevs)
+        return *mPhysDevs;
+
     std::vector<rp<IDXGIAdapter1>> adapters;
 
     rp<IDXGIAdapter1> cur;
@@ -56,7 +59,8 @@ MirvInstanceBackend_D12::EnumeratePhysicalDevices()
     }
 #endif
 
-    std::vector<rp<MirvPhysicalDevice>> ret;
+    mPhysDevs.reset(new std::vector<VkPhysicalDevice>);
+
     for (const auto& cur : adapters) {
         LARGE_INTEGER umdVersion;
         if (FAILED(cur->CheckInterfaceSupport(__uuidof(ID3D12Device), &umdVersion)))
@@ -66,10 +70,13 @@ MirvInstanceBackend_D12::EnumeratePhysicalDevices()
         if (FAILED(cur->GetDesc1(&desc)))
             continue;
 
-        ret.push_back(new MirvPhysicalDevice_D12(cur, umdVersion, desc));
+        const rp<MirvPhysicalDevice> pd = new MirvPhysicalDevice_D12(cur, umdVersion,
+                                                                     desc);
+        const auto handle = gPhysicalDevices.Put(pd);
+        mPhysDevs->push_back(handle);
     }
 
-    return ret;
+    return *mPhysDevs;
 }
 
 // -------------------------------------
@@ -218,12 +225,18 @@ MirvPhysicalDevice_D12::MirvPhysicalDevice_D12(IDXGIAdapter1* const adapter,
     queueFamily.timestampValidBits = 0; // 0 means unsupported
     queueFamily.minImageTransferGranularity = {1,1,1};
 
-    queueFamily.queueFlags = VK_QUEUE_GRAPHICS_BIT;
+    // D3D12_COMMAND_LIST_TYPE_DIRECT
+    queueFamily.queueFlags = (VK_QUEUE_GRAPHICS_BIT |
+                              VK_QUEUE_COMPUTE_BIT |
+                              VK_QUEUE_TRANSFER_BIT);
     mQueueFamilyProperties.push_back(queueFamily);
 
-    queueFamily.queueFlags = VK_QUEUE_COMPUTE_BIT;
+    // D3D12_COMMAND_LIST_TYPE_COMPUTE
+    queueFamily.queueFlags = (VK_QUEUE_COMPUTE_BIT |
+                              VK_QUEUE_TRANSFER_BIT);
     mQueueFamilyProperties.push_back(queueFamily);
 
+    // D3D12_COMMAND_LIST_TYPE_COPY
     queueFamily.queueFlags = VK_QUEUE_TRANSFER_BIT;
     mQueueFamilyProperties.push_back(queueFamily);
 }
@@ -233,7 +246,7 @@ MirvPhysicalDevice_D12::~MirvPhysicalDevice_D12() = default;
 VkResult
 MirvPhysicalDevice_D12::CreateDevice(const VkDeviceCreateInfo* const createInfo,
                                      const VkAllocationCallbacks* const allocator,
-                                     rp<MirvDevice>* const out_device) const
+                                     rp<MirvDevice>* const out_device)
 {
     const D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_12_0;
     rp<ID3D12Device> d3dDev;
@@ -244,10 +257,10 @@ MirvPhysicalDevice_D12::CreateDevice(const VkDeviceCreateInfo* const createInfo,
 
     rp<MirvDevice_D12> dev = new MirvDevice_D12(this, d3dDev);
 
-    auto queueInfoItr = createInfo->pQueueCreateInfos;
-    const auto& queueInfoEnd = queueInfoItr + createInfo->queueCreateInfoCount;
-    for (; queueInfoItr != queueInfoEnd; ++queueInfoItr) {
-        const auto res = dev->CreateQueues(queueInfoItr);
+    for (const auto& info : Range(createInfo->pQueueCreateInfos,
+                                  createInfo->queueCreateInfoCount))
+    {
+        const auto res = dev->CreateQueues(&info);
         if (res != VK_SUCCESS)
             return res;
     }
@@ -286,7 +299,7 @@ MirvDevice_D12::CreateQueues(const VkDeviceQueueCreateInfo* const info)
     const auto& didInsert = res.second;
     if (!didInsert)
         return VK_ERROR_INITIALIZATION_FAILED;
-    auto& queues = *(itr.first);
+    auto& queues = res.first->second;
 
     D3D12_COMMAND_QUEUE_DESC desc = {};
     desc.Type = [&]() {
@@ -304,10 +317,10 @@ MirvDevice_D12::CreateQueues(const VkDeviceQueueCreateInfo* const info)
 
     for (uint32_t i = 0; i < info->queueCount; i++) {
         rp<ID3D12CommandQueue> queue;
-        const auto hr = mDevice->CreateCommandQueue(desc, __uuidof(ID3D12CommandQueue),
-                                                    queue.AsOutVar());
+        const auto hr = mDevice->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue),
+                                                    (void**)queue.asOutVar());
         if (FAILED(hr)) {
-            assert(hr == E_OUTOFMEMORY)
+            assert(hr == E_OUTOFMEMORY);
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const rp<MirvQueue_D12> mirvQueue = new MirvQueue_D12(queue);

@@ -2,6 +2,7 @@ files = [
     'mirv.cpp',
     'mirv_entrypoints.cpp',
 ]
+libs = []
 
 ccflags = [
     '-EHsc',
@@ -21,7 +22,13 @@ if has_d3d12:
     files += [
         'mirv_d12.cpp',
     ]
+    libs += [
+        'dxgi.lib',
+        'd3d12.lib',
+    ]
 
 # --
 
-ENV.SharedLibrary('vulkan', files)
+ENV.SharedLibrary('vulkan', files, LIBS=libs)
+
+Program('test_vulkan', ['test_vulkan.cpp'])

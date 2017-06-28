@@ -1,0 +1,4 @@
+# Building
+
+`./scons/scons.py`
+

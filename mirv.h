@@ -2,16 +2,20 @@
 
 #include "vulkan.h"
 
+#include <algorithm>
 #include <cassert>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <stack>
+#include <unordered_map>
 #include <vector>
 
 #define HAS_D3D12
 //#define HAS_METAL
 //#define HAS_VULKAN
 
-#define VK_ERROR_NOT_IMPLEMENTED -2000000000
+#define VK_ERROR_NOT_IMPLEMENTED VkResult(-2000*1000*1000)
 
 ////
 
@@ -20,6 +24,60 @@ void
 Zero(T* const data)
 {
     memset(data, 0, sizeof(*data));
+}
+
+// -------------------------------------
+
+template<typename T>
+struct RangeImpl final
+{
+    T* const mBegin;
+    T* const mEnd;
+
+    RangeImpl(T* const begin, T* const end)
+        : mBegin(begin)
+        , mEnd(end)
+    { }
+
+    T* begin() const { return mBegin; }
+    T* end() const { return mEnd; }
+};
+
+template<typename T>
+RangeImpl<T>
+Range(T* const begin, T* const end)
+{
+    return RangeImpl<T>(begin, end);
+}
+
+template<typename T>
+RangeImpl<T>
+Range(T* const begin, const size_t n)
+{
+    return RangeImpl<T>(begin, begin + n);
+}
+
+// -------------------------------------
+
+template<typename T>
+VkResult
+VulkanArrayCopyMeme(const std::vector<T>& src, uint32_t* const out_count, T* const out_begin)
+{
+    if (!out_begin) {
+        *out_count = src.size();
+        return VK_SUCCESS;
+    }
+
+    VkResult res;
+    if (*out_count < src.size()) {
+        res = VK_INCOMPLETE;
+    } else {
+        res = VK_SUCCESS;
+        *out_count = src.size();
+    }
+
+    std::copy_n(src.cbegin(), *out_count, out_begin);
+    return res;
 }
 
 // -------------------------------------
@@ -33,7 +91,7 @@ protected:
         : mRefCount(0)
     {}
 
-    virtual ~RefCounted() = 0;
+    virtual ~RefCounted() {}
 
 public:
     void AddRef() const {
@@ -56,6 +114,8 @@ class rp final
 {
     T* mPtr;
 
+    template<typename U> friend class rp;
+
     inline void AddRef(T* const x)
     {
         mPtr = x;
@@ -75,6 +135,11 @@ class rp final
 
 public:
     rp()
+    {
+        AddRef(nullptr);
+    }
+
+    rp(nullptr_t)
     {
         AddRef(nullptr);
     }
@@ -156,58 +221,97 @@ AsRP(T* const x) {
 // -------------------------------------
 
 template<typename handleT, typename objectT>
-class ObjectTracker
+class ObjectTracker final
 {
     mutable std::mutex mMutex;
-    std::vector<rp<objectT>> mValid;
+
+    struct Slot final {
+        std::mutex mutex;
+        rp<objectT> object;
+    };
+
+    std::unordered_map<uint64_t, std::unique_ptr<Slot>> mSlots;
+    std::unordered_map<objectT*, handleT> mHandleLookup;
+    std::stack<handleT> mFreeList;
+    uint64_t mNextId;
 
 public:
-    handleT Track(objectT* const obj) {
-        assert(obj);
-        {
-            const std::lock_guard<std::mutex> guard(mMutex);
-            mValid.push_back(AsRP(obj));
-        }
-        return Handle(obj);
-    }
+    ObjectTracker()
+        : mNextId(1)
+    { }
 
-    void Untrack(const objectT* const obj) {
+    handleT Put(objectT* const obj) {
         const std::lock_guard<std::mutex> guard(mMutex);
-        std::remove(mValid.begin(), mValid.end(), obj);
+        return Put_WithLock(obj);
     }
 
-    objectT* GetTracked(const handleT handle) const {
-        if (!handle)
+    rp<objectT> Get(const handleT handle) const {
+        const std::lock_guard<std::mutex> guard(mMutex);
+        return Get_WithLock(handle);
+    }
+
+    handleT Ensure(objectT* const obj) {
+        const std::lock_guard<std::mutex> guard(mMutex);
+
+        const auto itr = mHandleLookup.find(obj);
+        if (itr == mHandleLookup.end())
+            return Put(obj);
+
+        return itr->second;
+    }
+
+    rp<objectT> Reset(const handleT handle) const {
+        const std::lock_guard<std::mutex> guard(mMutex);
+
+        const auto slot = Find(handle);
+        if (!slot)
             return nullptr;
 
-        const std::lock_guard<std::mutex> guard(mMutex);
-
-        const auto obj = (objectT*)handle;
-        if (!std::count(mValid.cbegin(), mValid.cend(), obj))
-            return nullptr;
-        return obj;
-    }
-
-    handleT Handle(const objectT* const obj) const {
-#ifdef DEBUG
-        const std::lock_guard<std::mutex> guard(mMutex);
-        assert(std::count(mValid.cbegin(), mValid.cend(), obj) == 1);
-#endif
-        return (handleT)obj;
-    }
-
-    std::vector<handleT> Enumerate() const {
-        std::vector<handleT> ret;
-        const std::lock_guard<std::mutex> guard(mMutex);
-        for (const auto& cur : mValid) {
-            ret.push_back(Handle(cur.get()));
-        }
+        const std::lock_guard<std::mutex> slotGuard(slot->mutex);
+        const auto ret = slot->object;
+        slot->object = nullptr;
+        mHandleLookup.erase(ret);
+        mFreeList.push(handle);
         return ret;
     }
 
-    size_t Count() const {
-        const std::lock_guard<std::mutex> guard(mMutex);
-        return mValid.size();
+private:
+    handleT Put_WithLock(objectT* const obj) {
+        handleT handle;
+        if (mFreeList.size()) {
+            handle = mFreeList.top();
+            mFreeList.pop();
+        } else {
+            mSlots.insert({mNextId, std::unique_ptr<Slot>(new Slot)});
+            handle = handleT(mNextId);
+            mNextId += 1;
+        }
+
+        const auto slot = Find(handle);
+        assert(slot);
+
+        const std::lock_guard<std::mutex> slotGuard(slot->mutex);
+        slot->object = obj;
+        mHandleLookup.insert({obj, handle});
+        return handle;
+    }
+
+    rp<objectT> Get_WithLock(const handleT handle) const {
+        const auto slot = Find(handle);
+        if (!slot)
+            return nullptr;
+
+        const std::lock_guard<std::mutex> slotGuard(slot->mutex);
+        return slot->object;
+    }
+
+    // ---
+
+    Slot* Find(const handleT handle) const {
+        const auto itr = mSlots.find(uint64_t(handle));
+        if (itr == mSlots.end())
+            return nullptr;
+        return itr->second.get();
     }
 };
 
@@ -237,14 +341,8 @@ class MirvInstance
     std::vector<rp<MirvInstanceBackend>> mBackends;
     void EnsureBackends();
 
-    ObjectTracker<VkPhysicalDevice, MirvPhysicalDevice> mPhysicalDevices;
-    void EnsurePhysicalDevices();
-
 public:
-    std::vector<VkPhysicalDevice> EnumeratePhysicalDevices() {
-        EnsurePhysicalDevices();
-        return mPhysicalDevices.Enumerate();
-    }
+    std::vector<VkPhysicalDevice> EnumeratePhysicalDevices();
 };
 
 // --
@@ -253,7 +351,7 @@ class MirvInstanceBackend
     : public RefCounted
 {
 public:
-    virtual const std::vector<rp<MirvPhysicalDevice>> EnumeratePhysicalDevices() = 0;
+    virtual std::vector<VkPhysicalDevice> EnumeratePhysicalDevices() = 0;
 };
 
 // --
@@ -279,7 +377,7 @@ protected:
 public:
     virtual VkResult CreateDevice(const VkDeviceCreateInfo* createInfo,
                                   const VkAllocationCallbacks* allocator,
-                                  rp<MirvDevice>* out_device) const = 0;
+                                  rp<MirvDevice>* out_device) = 0;
 };
 
 // --
@@ -302,3 +400,10 @@ protected:
     explicit MirvDevice(MirvPhysicalDevice* physDev);
     ~MirvDevice() override;
 };
+
+// ---------------------
+
+extern ObjectTracker<VkInstance, MirvInstance> gInstances;
+extern ObjectTracker<VkPhysicalDevice, MirvPhysicalDevice> gPhysicalDevices;
+extern ObjectTracker<VkDevice, MirvDevice> gDevices;
+extern ObjectTracker<VkQueue, MirvQueue> gQueues;

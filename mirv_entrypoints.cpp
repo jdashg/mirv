@@ -5,21 +5,12 @@
 
 //////////////////////////////////////////////
 
-static ObjectTracker<VkInstance, MirvInstance> sInstances;
-
-//////////////////////////////////////////////
-
 VKAPI_ATTR VkResult VKAPI_CALL
 vkEnumerateInstanceLayerProperties(uint32_t* const out_propertyCount,
                                    VkLayerProperties* const out_properties)
 {
-    if (!out_properties) {
-        *out_propertyCount = 0;
-        return VK_SUCCESS;
-    }
-
-    *out_propertyCount = 0;
-    return VK_SUCCESS;
+    std::vector<VkLayerProperties> props;
+    return VulkanArrayCopyMeme(props, out_propertyCount, out_properties);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -30,13 +21,8 @@ vkEnumerateInstanceExtensionProperties(const char* const layerName,
     if (layerName)
         return VK_ERROR_LAYER_NOT_PRESENT;
 
-    if (!out_properties) {
-        *out_propertyCount = 0;
-        return VK_SUCCESS;
-    }
-
-    *out_propertyCount = 0;
-    return VK_SUCCESS;
+    std::vector<VkExtensionProperties> props;
+    return VulkanArrayCopyMeme(props, out_propertyCount, out_properties);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -44,7 +30,7 @@ vkCreateInstance(const VkInstanceCreateInfo* const createInfo,
                  const VkAllocationCallbacks* const allocator,
                  VkInstance* const out)
 {
-    if (!createInfo) {
+    if (!createInfo)
         return VK_ERROR_VALIDATION_FAILED_EXT;
     if (createInfo->sType != VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO)
         return VK_ERROR_VALIDATION_FAILED_EXT;
@@ -76,7 +62,7 @@ vkCreateInstance(const VkInstanceCreateInfo* const createInfo,
         return VK_ERROR_NOT_IMPLEMENTED;
 
     const rp<MirvInstance> created = new MirvInstance;
-    *out = sInstances.Track(created);
+    *out = gInstances.Put(created);
     return VK_SUCCESS;
 }
 
@@ -84,22 +70,13 @@ VKAPI_ATTR VkResult VKAPI_CALL
 vkEnumeratePhysicalDevices(VkInstance instance, uint32_t* const out_physicalDeviceCount,
                            VkPhysicalDevice* const out_physicalDevices)
 {
-    const auto inst = sInstances.GetTracked(instance);
+    const auto inst = gInstances.Get(instance);
     if (!inst)
         return VK_ERROR_VALIDATION_FAILED_EXT;
 
-    const auto& physicalDevices = inst->EnumeratePhysicalDevices();
-    if (!out_physicalDevices) {
-        *out_physicalDeviceCount = physicalDevices.size();
-        return VK_SUCCESS;
-    }
-
-    if (*out_physicalDeviceCount < physicalDevices.size())
-        return VK_INCOMPLETE;
-
-    *out_physicalDeviceCount = physicalDevices.size();
-    std::copy(physicalDevices.cbegin(), physicalDevices.cend(), out_physicalDevices);
-    return VK_SUCCESS;
+    const auto& physDevs = inst->EnumeratePhysicalDevices();
+    return VulkanArrayCopyMeme(physDevs, out_physicalDeviceCount,
+                               out_physicalDevices);
 }
 
 /*
@@ -123,50 +100,29 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(
 */
 
 VKAPI_ATTR void VKAPI_CALL
-vkGetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
+vkGetPhysicalDeviceProperties(const VkPhysicalDevice handle,
                               VkPhysicalDeviceProperties* const out_properties)
 {
-    const auto physDev = MirvPhysicalDevice::From(physicalDevice);
-    if (!physDev) {
-        ZeroMemory(out_properties);
-        return; // VK_ERROR_VALIDATION_FAILED_EXT
-    }
+    const auto physDev = gPhysicalDevices.Get(handle);
+    if (!physDev)
+        return;
 
     *out_properties = physDev->mProperties;
-    return; // VK_SUCCESS
 }
 
 VKAPI_ATTR void VKAPI_CALL
-vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physicalDevice,
+vkGetPhysicalDeviceQueueFamilyProperties(const VkPhysicalDevice handle,
                                          uint32_t* const out_propertyCount,
                                          VkQueueFamilyProperties* const out_properties)
 {
-    const auto physDev = MirvPhysicalDevice::From(physicalDevice);
-    if (!physDev) {
-        ZeroMemory(out_properties);
-        return; // VK_ERROR_VALIDATION_FAILED_EXT
-    }
+    const auto physDev = gPhysicalDevices.Get(handle);
+    if (!physDev)
+        return;
 
     const auto& properties = physDev->mQueueFamilyProperties;
-
-    if (!out_properties) {
-        *out_propertyCount = properties.size();
-        return;// VK_SUCCESS;
-    }
-
-    if (*out_propertyCount < properties.size()) {
-        ZeroMemory(out_properties);
-        return;// VK_INCOMPLETE;
-    }
-    *out_propertyCount = properties.size();
-
-    auto outItr = out_properties;
-    for (const auto& cur : properties) {
-        *outItr = cur;
-        ++outItr;
-    }
-    return; // VK_SUCCESS
+    (void)VulkanArrayCopyMeme(properties, out_propertyCount, out_properties);
 }
+
 /*
 VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties(
     VkPhysicalDevice                            physicalDevice,
@@ -174,21 +130,20 @@ VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties(
 */
 
 VKAPI_ATTR VkResult VKAPI_CALL
-vkCreateDevice(VkPhysicalDevice physicalDevice,
+vkCreateDevice(const VkPhysicalDevice handle,
                const VkDeviceCreateInfo* createInfo,
                const VkAllocationCallbacks* allocator,
                VkDevice* const out_device)
 {
-    const auto physDev = MirvPhysicalDevice::From(physicalDevice);
+    const auto physDev = gPhysicalDevices.Get(handle);
     if (!physDev)
-        return VK_ERROR_VALIDATION_FAILED_EXT
+        return VK_ERROR_VALIDATION_FAILED_EXT;
 
-    rp<MirvDevice> ret;
-    const auto res = physDev->CreateDevice(createInfo, allocator, &ret);
-    if (res == VK_SUCCESS) {
-        MirvDevice::Track(ret);
-        *out_device = ret->ToOpaque();
-        ret->AddRef();
-    }
-    return res;
+    rp<MirvDevice> device;
+    const auto res = physDev->CreateDevice(createInfo, allocator, &device);
+    if (res != VK_SUCCESS)
+        return res;
+
+    *out_device = gDevices.Put(device);
+    return VK_SUCCESS;
 }

@@ -5,6 +5,13 @@
 
 //////////////////////////////////////////////
 
+ObjectTracker<VkInstance, MirvInstance> gInstances;
+ObjectTracker<VkPhysicalDevice, MirvPhysicalDevice> gPhysicalDevices;
+ObjectTracker<VkDevice, MirvDevice> gDevices;
+ObjectTracker<VkQueue, MirvQueue> gQueues;
+
+//////////////////////////////////////////////
+
 #ifndef HAS_D3D12
 MirvInstanceBackend* MirvInstance::CreateBackend_D3D12() { return nullptr; }
 #endif
@@ -32,19 +39,17 @@ MirvInstance::EnsureBackends()
     fnAdd(CreateBackend_Vulkan());
 }
 
-void
-MirvInstance::EnsurePhysicalDevices()
+std::vector<VkPhysicalDevice>
+MirvInstance::EnumeratePhysicalDevices()
 {
-    if (mPhysicalDevices.Count())
-        return;
-
     EnsureBackends();
+
+    std::vector<VkPhysicalDevice> ret;
     for (const auto& backend : mBackends) {
-        const auto& backendPDs = backend->EnumeratePhysicalDevices();
-        for (const auto& pd : backendPDs) {
-            (void)mPhysicalDevices.Track(pd);
-        }
+        const auto& perBackend = backend->EnumeratePhysicalDevices();
+        ret.insert(ret.end(), perBackend.begin(), perBackend.end());
     }
+    return ret;
 }
 
 // --

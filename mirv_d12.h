@@ -15,12 +15,13 @@ struct DXGI_ADAPTER_DESC1;
 class MirvInstanceBackend_D12 final : public MirvInstanceBackend
 {
     const rp<IDXGIFactory1> mFactory;
+    std::unique_ptr<std::vector<VkPhysicalDevice>> mPhysDevs;
 
 public:
     explicit MirvInstanceBackend_D12(IDXGIFactory1* factory);
     ~MirvInstanceBackend_D12() override;
 
-    virtual const std::vector<rp<MirvPhysicalDevice>> EnumeratePhysicalDevices() override;
+    virtual std::vector<VkPhysicalDevice> EnumeratePhysicalDevices() override;
 };
 
 // --
@@ -36,7 +37,7 @@ public:
 
     virtual VkResult CreateDevice(const VkDeviceCreateInfo* createInfo,
                                   const VkAllocationCallbacks* allocator,
-                                  rp<MirvDevice>* out_device) const override;
+                                  rp<MirvDevice>* out_device) override;
 };
 
 // --
@@ -59,8 +60,8 @@ class MirvDevice_D12 final : public MirvDevice
     std::map< uint32_t, std::vector<rp<MirvQueue_D12>> > mQueuesByFamily;
 
 public:
-    MirvDevice_D12(const std::vector<rp<MirvQueue>>& queues, ID3D12Device* device);
+    MirvDevice_D12(MirvPhysicalDevice_D12* physDev, ID3D12Device* device);
     ~MirvDevice_D12() override;
 
-    VkResult AddQueue(const VkDeviceQueueCreateInfo* info);
+    VkResult CreateQueues(const VkDeviceQueueCreateInfo* info);
 };
