@@ -1,4 +1,10 @@
-.sconsign.dblite
 *.dll
 *.exe
 *.obj
+*.o
+*.lib
+*.so
+*.bin
+*.pdb
+*.ilk
+*.exp
