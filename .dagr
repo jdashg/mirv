@@ -1,0 +1,160 @@
+import os
+import subprocess
+import sys
+
+DEBUG = True
+MSVC = True
+
+ENV = os.environ
+
+try:
+    CC = [ENV['CC']]
+except KeyError:
+    if MSVC:
+        CC = ['cl', '-nologo']
+    else:
+        CC = ['cc']
+
+#CC = ['python', '../ocache/ocache.py'] + CC
+
+try:
+    LD = [ENV['LD']]
+except KeyError:
+    LD = CC[:]
+
+try:
+    p = subprocess.Popen(CC, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p.communicate()
+except OSError:
+    sys.stderr.write('WARNING: CC not found.\n')
+
+
+'''
+EXAMPLE_CL_ARGS = [
+    'cl.EXE', '-FoUnified_cpp_dom_canvas1.obj', '-c',
+    '-Ic:/dev/mozilla/gecko-cinn3-obj/dist/stl_wrappers', '-DDEBUG=1', '-DTRACING=1',
+    '-DWIN32_LEAN_AND_MEAN', '-D_WIN32', '-DWIN32', '-D_CRT_RAND_S',
+    '-DCERT_CHAIN_PARA_HAS_EXTRA_FIELDS', '-DOS_WIN=1', '-D_UNICODE', '-DCHROMIUM_BUILD',
+    '-DU_STATIC_IMPLEMENTATION', '-DUNICODE', '-D_WINDOWS', '-D_SECURE_ATL',
+    '-DCOMPILER_MSVC', '-DSTATIC_EXPORTABLE_JS_API', '-DMOZ_HAS_MOZGLUE',
+    '-DMOZILLA_INTERNAL_API', '-DIMPL_LIBXUL', '-Ic:/dev/mozilla/gecko-cinn3/dom/canvas',
+    '-Ic:/dev/mozilla/gecko-cinn3-obj/dom/canvas',
+    '-Ic:/dev/mozilla/gecko-cinn3/js/xpconnect/wrappers',
+    '-Ic:/dev/mozilla/gecko-cinn3-obj/ipc/ipdl/_ipdlheaders',
+    '-Ic:/dev/mozilla/gecko-cinn3/ipc/chromium/src',
+    '-Ic:/dev/mozilla/gecko-cinn3/ipc/glue', '-Ic:/dev/mozilla/gecko-cinn3/dom/workers',
+    '-Ic:/dev/mozilla/gecko-cinn3/dom/base', '-Ic:/dev/mozilla/gecko-cinn3/dom/html',
+    '-Ic:/dev/mozilla/gecko-cinn3/dom/svg', '-Ic:/dev/mozilla/gecko-cinn3/dom/workers',
+    '-Ic:/dev/mozilla/gecko-cinn3/dom/xul', '-Ic:/dev/mozilla/gecko-cinn3/gfx/gl',
+    '-Ic:/dev/mozilla/gecko-cinn3/image', '-Ic:/dev/mozilla/gecko-cinn3/js/xpconnect/src',
+    '-Ic:/dev/mozilla/gecko-cinn3/layout/generic',
+    '-Ic:/dev/mozilla/gecko-cinn3/layout/style',
+    '-Ic:/dev/mozilla/gecko-cinn3/layout/xul',
+    '-Ic:/dev/mozilla/gecko-cinn3/media/libyuv/include',
+    '-Ic:/dev/mozilla/gecko-cinn3/gfx/skia',
+    '-Ic:/dev/mozilla/gecko-cinn3/gfx/skia/skia/include/config',
+    '-Ic:/dev/mozilla/gecko-cinn3/gfx/skia/skia/include/core',
+    '-Ic:/dev/mozilla/gecko-cinn3/gfx/skia/skia/include/gpu',
+    '-Ic:/dev/mozilla/gecko-cinn3/gfx/skia/skia/include/utils',
+    '-Ic:/dev/mozilla/gecko-cinn3-obj/dist/include',
+    '-Ic:/dev/mozilla/gecko-cinn3-obj/dist/include/nspr',
+    '-Ic:/dev/mozilla/gecko-cinn3-obj/dist/include/nss', '-MD', '-FI',
+    'c:/dev/mozilla/gecko-cinn3-obj/mozilla-config.h', '-DMOZILLA_CLIENT', '-Oy-', '-TP',
+    '-nologo', '-wd5026', '-wd5027', '-Zc:sizedDealloc-', '-Zc:threadSafeInit-',
+    '-wd4091', '-wd4577', '-D_HAS_EXCEPTIONS=0', '-W3', '-Gy', '-Zc:inline', '-utf-8',
+    '-FS', '-Gw', '-wd4251', '-wd4244', '-wd4267', '-wd4345', '-wd4351', '-wd4800',
+    '-wd4595', '-we4553', '-GR-', '-Z7', '-Oy-', '-WX',
+    '-Ic:/dev/mozilla/gecko-cinn3-obj/dist/include/cairo', '-wd4312',
+    'c:/dev/mozilla/gecko-cinn3-obj/dom/canvas/Unified_cpp_dom_canvas1.cpp'
+]
+'''
+
+CC += [
+    '-c',
+    '-EHsc',
+    '-DVC_EXTRALEAN',
+    '-DDEBUG=1',
+    '-TP',
+]
+
+def compile_calls(cc, source_files):
+    return list(map(lambda x: cc + [x], source_files))
+
+def obj_files(source_files):
+    return list(map(to_obj, source_files))
+
+def out_name(out_name):
+    if MSVC:
+        return ['-Fe' + out_name]
+    return ['-o', out_name]
+
+def to_obj(x):
+    (base, ext) = x.rsplit('.', 1)
+    return '{}.obj'.format(base)
+
+shared_arg = '-shared'
+if MSVC:
+    CC += [
+        '-FS',
+        '-W3', # MSVC's Wall is insane.
+        '-wd4996', # "warning C4996: 'strncpy': This function or variable may be unsafe. Consider using strncpy_s instead. [...]"
+    ]
+    if DEBUG:
+        CC += ['-Z7']
+        LD += ['-Z7']
+        shared_arg = '-LDd'
+        bin_arg = '-MDd'
+    else:
+        shared_arg = '-LD'
+        bin_arg = '-MD'
+
+print('CC: {}'.format(CC))
+
+# --
+
+lib_cc = CC + [
+    '-DVK_NO_PROTOTYPES',
+]
+
+lib_sources = [
+    'mirv.cpp',
+    'mirv_entrypoints.cpp',
+]
+lib_libs = []
+
+if MSVC:
+    lib_sources += [
+        'mirv_d12.cpp',
+    ]
+    lib_cc += ['-DHAS_D3D12']
+    lib_libs += [
+        'dxgi.lib',
+        'd3d12.lib',
+    ]
+
+
+lib_o = DagrNode('lib_o', [])
+lib_o.cmds = compile_calls(lib_cc, lib_sources)
+
+lib = DagrNode('lib', [lib_o],
+               LD + [shared_arg] + out_name('vulkan') + lib_libs + obj_files(lib_sources))
+
+# --
+
+test_sources = [
+    'test_vulkan.cpp',
+]
+test_libs = [ 'vulkan.lib' ]
+
+test_o = DagrNode('test_o', [lib])
+test_o.cmds = compile_calls(CC, test_sources)
+
+test = DagrNode('test', [test_o],
+                LD + [bin_arg] + out_name('test_vulkan') + test_libs + obj_files(test_sources) + ['-link', '-DEBUG:FULL'])
+
+DagrNode('DEFAULT', [lib, test])
+
+rm_bin = 'rm'
+if MSVC:
+    rm_bin = 'del'
+DagrNode('clean', [], rm_bin + ' *.o *.obj *.lib *.so *.dll *.bin *.exe *.pdb *.ilk *.exp')
