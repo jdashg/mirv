@@ -4,40 +4,41 @@
 
 #include <windows.h>
 
-class ID3D12CommandQueue;
-class ID3D12Device;
-class IDXGIAdapter1;
-class IDXGIFactory1;
+struct ID3D12CommandQueue;
+struct ID3D12Device;
+struct IDXGIAdapter1;
+struct IDXGIFactory1;
 struct DXGI_ADAPTER_DESC1;
-
-// --
-
-class MirvInstanceBackend_D12 final : public MirvInstanceBackend
-{
-    const rp<IDXGIFactory1> mFactory;
-    std::unique_ptr<std::vector<VkPhysicalDevice>> mPhysDevs;
-
-public:
-    explicit MirvInstanceBackend_D12(IDXGIFactory1* factory);
-    ~MirvInstanceBackend_D12() override;
-
-    virtual std::vector<VkPhysicalDevice> EnumeratePhysicalDevices() override;
-};
 
 // --
 
 class MirvPhysicalDevice_D12 final : public MirvPhysicalDevice
 {
+    const rp<IDXGIFactory1> mFactory;
     const rp<IDXGIAdapter1> mAdapter;
 
 public:
-    MirvPhysicalDevice_D12(IDXGIAdapter1* adapter, const LARGE_INTEGER& umdVersion,
+    MirvPhysicalDevice_D12(MirvInstance& instance, IDXGIAdapter1* adapter,
                            const DXGI_ADAPTER_DESC1& desc);
     ~MirvPhysicalDevice_D12() override;
 
-    virtual VkResult CreateDevice(const VkDeviceCreateInfo* createInfo,
-                                  const VkAllocationCallbacks* allocator,
-                                  rp<MirvDevice>* out_device) override;
+    VkResult CreateDevice(const VkDeviceCreateInfo& createInfo,
+                          rp<MirvDevice>* out_device) override;
+};
+
+// --
+
+class MirvDevice_D12 final : public MirvDevice
+{
+    const rp<ID3D12Device> mDevice;
+
+public:
+    MirvDevice_D12(MirvPhysicalDevice_D12& physDev, ID3D12Device* device);
+    ~MirvDevice_D12() override;
+
+    VkResult AddQueues(const VkDeviceQueueCreateInfo& info,
+                       const VkQueueFamilyProperties& familyInfo,
+                       std::vector<rp<MirvQueue>>* out) override;
 };
 
 // --
@@ -47,21 +48,7 @@ class MirvQueue_D12 final : public MirvQueue
     const rp<ID3D12CommandQueue> mQueue;
 
 public:
-    explicit MirvQueue_D12(ID3D12CommandQueue* queue);
+    MirvQueue_D12(MirvDevice_D12& device, const VkQueueFamilyProperties& family,
+                  ID3D12CommandQueue* queue);
     ~MirvQueue_D12() override;
-};
-
-// --
-
-class MirvDevice_D12 final : public MirvDevice
-{
-    const rp<ID3D12Device> mDevice;
-
-    std::map< uint32_t, std::vector<rp<MirvQueue_D12>> > mQueuesByFamily;
-
-public:
-    MirvDevice_D12(MirvPhysicalDevice_D12* physDev, ID3D12Device* device);
-    ~MirvDevice_D12() override;
-
-    VkResult CreateQueues(const VkDeviceQueueCreateInfo* info);
 };

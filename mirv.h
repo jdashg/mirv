@@ -3,61 +3,19 @@
 #include "vulkan.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stack>
 #include <unordered_map>
 #include <vector>
 
-#define HAS_D3D12
-//#define HAS_METAL
-//#define HAS_VULKAN
+#include "util.h"
 
 #define VK_ERROR_NOT_IMPLEMENTED VkResult(-2000*1000*1000)
-
-////
-
-template<typename T>
-void
-Zero(T* const data)
-{
-    memset(data, 0, sizeof(*data));
-}
-
-// -------------------------------------
-
-template<typename T>
-struct RangeImpl final
-{
-    T* const mBegin;
-    T* const mEnd;
-
-    RangeImpl(T* const begin, T* const end)
-        : mBegin(begin)
-        , mEnd(end)
-    { }
-
-    T* begin() const { return mBegin; }
-    T* end() const { return mEnd; }
-};
-
-template<typename T>
-RangeImpl<T>
-Range(T* const begin, T* const end)
-{
-    return RangeImpl<T>(begin, end);
-}
-
-template<typename T>
-RangeImpl<T>
-Range(T* const begin, const size_t n)
-{
-    return RangeImpl<T>(begin, begin + n);
-}
-
-// -------------------------------------
 
 template<typename T>
 VkResult
@@ -80,11 +38,24 @@ VulkanArrayCopyMeme(const std::vector<T>& src, uint32_t* const out_count, T* con
     return res;
 }
 
+template<typename T>
+bool
+SnapshotStruct(T* const dest, const T* const src, const VkStructureType type)
+{
+    const auto srcType = src->sType;
+    if (srcType != type)
+        return false;
+
+    Copy(dest, src);
+    dest->sType = srcType; // Catch racey copies.
+    return true;
+}
+
 // -------------------------------------
 
 class RefCounted
 {
-    mutable size_t mRefCount;
+    mutable std::atomic<size_t> mRefCount;
 
 protected:
     RefCounted()
@@ -96,18 +67,22 @@ protected:
 public:
     void AddRef() const {
         const auto res = ++mRefCount;
-        assert(res > 0);
+        //printf("%p: AddRef => %u\n", this, res);
+        ASSERT(res > 0)
     }
 
     void Release() const {
         const auto res = --mRefCount;
-        assert(res < SIZE_MAX/2);
+        //printf("%p: Release => %u\n", this, res);
+        ASSERT(res < SIZE_MAX/2)
         if (res > 0)
             return;
 
         delete this;
     }
 };
+
+//#define SPEW_RP
 
 template<typename T>
 class rp final
@@ -116,18 +91,16 @@ class rp final
 
     template<typename U> friend class rp;
 
-    inline void AddRef(T* const x)
+    inline void Swap(T* const x)
     {
-        mPtr = x;
-        if (mPtr) {
-            mPtr->AddRef();
+#ifdef SPEW_RP
+        printf("[%p] %p => %p\n", this, mPtr, x);
+#endif
+        if (x) {
+            x->AddRef();
         }
-    }
-
-    inline void Release()
-    {
         const auto was = mPtr;
-        mPtr = nullptr;
+        mPtr = x;
         if (was) {
             was->Release();
         }
@@ -135,39 +108,50 @@ class rp final
 
 public:
     rp()
-    {
-        AddRef(nullptr);
-    }
+        : mPtr(nullptr)
+    { }
 
     rp(nullptr_t)
+        : mPtr(nullptr)
+    { }
+
+    rp(const rp<T>& x)
+        : mPtr(nullptr)
     {
-        AddRef(nullptr);
+        Swap(x.mPtr);
+    }
+    rp(rp<T>&& x)
+        : mPtr(x.mPtr)
+    {
+        x.mPtr = nullptr;
     }
 
     template<typename U>
     rp(U* const x)
+        : mPtr(nullptr)
     {
-        AddRef(x);
+        Swap(x);
     }
 
     template<typename U>
     explicit rp(const rp<U>& x)
+        : mPtr(nullptr)
     {
-        AddRef(x.mPtr);
+        Swap(x.mPtr);
     }
-
+    /*
     template<typename U>
     explicit rp(rp<U>&& x)
     {
         mPtr = x.mPtr;
         x.mPtr = nullptr;
     }
-
+    */
     ////
 
     ~rp()
     {
-        Release();
+        Swap(nullptr);
     }
 
     ////
@@ -175,26 +159,39 @@ public:
     template<typename U>
     rp<T>& operator =(U* const x)
     {
-        Release();
-        AddRef(x);
+        Swap(x);
         return *this;
     }
 
     template<typename U>
     rp<T>& operator =(const rp<U>& x)
     {
-        Release();
-        AddRef(x.mPtr);
+        ASSERT((uintptr_t)&x != (uintptr_t)this)
+        Swap(x.mPtr);
+        return *this;
+    }
+
+    rp<T>& operator =(const rp<T>& x)
+    {
+        Swap(x.mPtr);
+        return *this;
+    }
+    rp<T>& operator =(rp<T>&& x)
+    {
+        std::swap(mPtr, x.mPtr);
         return *this;
     }
 
     ////
 
     T* get() const { return mPtr; }
-    operator T*() const { return mPtr; }
+    //operator T*() const { return mPtr; }
 
     T** asOutVar() {
-        Release();
+        Swap(nullptr);
+#ifdef SPEW_RP
+        printf("[%p] asOutVar\n", this);
+#endif
         return &mPtr;
     }
 
@@ -202,6 +199,10 @@ public:
 
     T* operator ->() const { return mPtr; }
     operator bool() const { return bool(mPtr); }
+
+    bool operator <(const rp<T>& x) const {
+        return mPtr < x.mPtr;
+    }
 
     template<typename U>
     bool operator ==(const rp<U>& x) const {
@@ -218,140 +219,73 @@ AsRP(T* const x) {
     return rp<T>(x);
 }
 
-// -------------------------------------
-
-template<typename handleT, typename objectT>
-class ObjectTracker final
-{
-    mutable std::mutex mMutex;
-
-    struct Slot final {
-        std::mutex mutex;
-        rp<objectT> object;
-    };
-
-    std::unordered_map<uint64_t, std::unique_ptr<Slot>> mSlots;
-    std::unordered_map<objectT*, handleT> mHandleLookup;
-    std::stack<handleT> mFreeList;
-    uint64_t mNextId;
-
-public:
-    ObjectTracker()
-        : mNextId(1)
-    { }
-
-    handleT Put(objectT* const obj) {
-        const std::lock_guard<std::mutex> guard(mMutex);
-        return Put_WithLock(obj);
-    }
-
-    rp<objectT> Get(const handleT handle) const {
-        const std::lock_guard<std::mutex> guard(mMutex);
-        return Get_WithLock(handle);
-    }
-
-    handleT Ensure(objectT* const obj) {
-        const std::lock_guard<std::mutex> guard(mMutex);
-
-        const auto itr = mHandleLookup.find(obj);
-        if (itr == mHandleLookup.end())
-            return Put(obj);
-
-        return itr->second;
-    }
-
-    rp<objectT> Reset(const handleT handle) const {
-        const std::lock_guard<std::mutex> guard(mMutex);
-
-        const auto slot = Find(handle);
-        if (!slot)
-            return nullptr;
-
-        const std::lock_guard<std::mutex> slotGuard(slot->mutex);
-        const auto ret = slot->object;
-        slot->object = nullptr;
-        mHandleLookup.erase(ret);
-        mFreeList.push(handle);
-        return ret;
-    }
-
-private:
-    handleT Put_WithLock(objectT* const obj) {
-        handleT handle;
-        if (mFreeList.size()) {
-            handle = mFreeList.top();
-            mFreeList.pop();
-        } else {
-            mSlots.insert({mNextId, std::unique_ptr<Slot>(new Slot)});
-            handle = handleT(mNextId);
-            mNextId += 1;
-        }
-
-        const auto slot = Find(handle);
-        assert(slot);
-
-        const std::lock_guard<std::mutex> slotGuard(slot->mutex);
-        slot->object = obj;
-        mHandleLookup.insert({obj, handle});
-        return handle;
-    }
-
-    rp<objectT> Get_WithLock(const handleT handle) const {
-        const auto slot = Find(handle);
-        if (!slot)
-            return nullptr;
-
-        const std::lock_guard<std::mutex> slotGuard(slot->mutex);
-        return slot->object;
-    }
-
-    // ---
-
-    Slot* Find(const handleT handle) const {
-        const auto itr = mSlots.find(uint64_t(handle));
-        if (itr == mSlots.end())
-            return nullptr;
-        return itr->second.get();
-    }
-};
-
 template<typename T>
 struct QI final
 {
     template<typename U>
-    static rp<T> From(const rp<U>& x) {
+    static rp<T> From(const U& x) {
         rp<T> ret;
-        x->QueryInterface(__uuidof(T), ret.asOutVar());
+        x->QueryInterface(__uuidof(T), (void**)ret.asOutVar());
         return ret;
     }
 };
 
 // -------------------------------------
 
-class MirvInstanceBackend;
-class MirvPhysicalDevice;
+enum class MirvObjectType {
+    Instance,
+    PhysicalDevice,
+    Device,
+    Queue,
+};
 
-class MirvInstance
-    : public RefCounted
-{
-    MirvInstanceBackend* CreateBackend_D3D12();
-    MirvInstanceBackend* CreateBackend_Metal();
-    MirvInstanceBackend* CreateBackend_Vulkan();
-
-    std::vector<rp<MirvInstanceBackend>> mBackends;
-    void EnsureBackends();
-
-public:
-    std::vector<VkPhysicalDevice> EnumeratePhysicalDevices();
+enum class Backends {
+    D3D12,
+    Metal,
+    Vulkan,
 };
 
 // --
 
-class MirvInstanceBackend
-    : public RefCounted
+class HandleTable;
+
+struct MirvObject : public RefCounted
+{
+    friend class HandleTable;
+
+    const MirvObjectType mType;
+private:
+    uint64_t mHandle;
+public:
+    mutable std::mutex mMutex;
+
+    explicit MirvObject(const MirvObjectType type)
+        : mType(type)
+        , mHandle(0)
+    { }
+
+    DECL_GETTER(Handle);
+};
+
+// --
+
+
+// -------------------------------------
+
+class MirvPhysicalDevice;
+
+class MirvInstance
+    : public MirvObject
 {
 public:
-    virtual std::vector<VkPhysicalDevice> EnumeratePhysicalDevices() = 0;
+    std::vector<rp<MirvPhysicalDevice>> mPhysDevs;
+
+    explicit MirvInstance();
+    ~MirvInstance();
+
+private:
+    template<Backends B>
+    void AddPhysDevs();
 };
 
 // --
@@ -359,15 +293,19 @@ public:
 class MirvDevice;
 
 class MirvPhysicalDevice
-    : public RefCounted
+    : public MirvObject
 {
 public:
+    MirvInstance& mInstance;
+
     VkPhysicalDeviceProperties mProperties;
     VkPhysicalDeviceLimits mLimits;
     std::vector<VkQueueFamilyProperties> mQueueFamilyProperties;
 
 protected:
-    MirvPhysicalDevice()
+    MirvPhysicalDevice(MirvInstance& instance)
+        : MirvObject(MirvObjectType::PhysicalDevice)
+        , mInstance(instance)
     {
         Zero(&mProperties);
         Zero(&mLimits);
@@ -375,35 +313,90 @@ protected:
     }
 
 public:
-    virtual VkResult CreateDevice(const VkDeviceCreateInfo* createInfo,
-                                  const VkAllocationCallbacks* allocator,
+    virtual VkResult CreateDevice(const VkDeviceCreateInfo& createInfo,
                                   rp<MirvDevice>* out_device) = 0;
 };
 
 // --
 
-class MirvQueue
-    : public RefCounted
+class MirvQueue;
+
+class MirvDevice
+    : public MirvObject
 {
+public:
+    MirvPhysicalDevice& mPhysDev;
+
+    std::map< uint32_t, std::vector<rp<MirvQueue>> > mQueuesByFamily;
+
+    explicit MirvDevice(MirvPhysicalDevice& physDev);
+    ~MirvDevice() override;
+
+public:
+    VkResult AddAllQueues(const VkDeviceCreateInfo& info);
+
+protected:
+    virtual VkResult AddQueues(const VkDeviceQueueCreateInfo& info,
+                               const VkQueueFamilyProperties& familyInfo,
+                               std::vector<rp<MirvQueue>>* out) = 0;
 };
 
 // --
 
-class MirvDevice
-    : public RefCounted
+class MirvQueue
+    : public MirvObject
 {
-protected:
-    const rp<MirvPhysicalDevice> mPhysDev;
+public:
+    MirvDevice& mDevice;
+    const VkQueueFamilyProperties& mFamily;
 
-    std::map<uint32_t,std::vector< rp<MirvQueue> >> mQueuesByFamily;
-
-    explicit MirvDevice(MirvPhysicalDevice* physDev);
-    ~MirvDevice() override;
+    MirvQueue(MirvDevice& device, const VkQueueFamilyProperties& family)
+        : MirvObject(MirvObjectType::Queue)
+        , mDevice(device)
+        , mFamily(family)
+    { }
 };
 
-// ---------------------
+// -----------------
 
-extern ObjectTracker<VkInstance, MirvInstance> gInstances;
-extern ObjectTracker<VkPhysicalDevice, MirvPhysicalDevice> gPhysicalDevices;
-extern ObjectTracker<VkDevice, MirvDevice> gDevices;
-extern ObjectTracker<VkQueue, MirvQueue> gQueues;
+namespace Handles {
+
+uint64_t AddT(MirvObject* obj);
+rp<MirvObject> GetT(uint64_t handle, MirvObjectType type);
+rp<MirvObject> RemoveT(uint64_t handle, MirvObjectType type);
+
+#define _(X) \
+inline Vk##X \
+Add(Mirv##X* const obj) \
+{ \
+    return Vk##X(AddT(obj)); \
+} \
+inline rp<Mirv##X> \
+Get(const Vk##X handle) \
+{ \
+    const auto& obj = GetT(uint64_t(handle), MirvObjectType::X); \
+    return static_cast<Mirv##X*>(obj.get()); \
+} \
+inline rp<Mirv##X> \
+Remove(const Vk##X handle) \
+{ \
+    const auto& obj = RemoveT(uint64_t(handle), MirvObjectType::X); \
+    return static_cast<Mirv##X*>(obj.get()); \
+}
+
+_(Instance)
+_(PhysicalDevice)
+_(Device)
+_(Queue)
+
+#undef _
+
+template<typename T>
+inline rp<T>
+Remove(const T* const obj)
+{
+    const auto& ret = RemoveT(obj);
+    return static_cast<T*>(ret);
+}
+
+} // namespace Handles
