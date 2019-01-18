@@ -17,7 +17,7 @@
 #ifdef DEBUG
 #define ALWAYS_TRUE(x) ASSERT(x)
 #else
-#define ALWAYS_TRUE(x) (void)(x)
+#define ALWAYS_TRUE(x) (void)(x);
 #endif
 
 // --

@@ -22,7 +22,7 @@ VkResult
 VulkanArrayCopyMeme(const std::vector<T>& src, uint32_t* const out_count, T* const out_begin)
 {
     if (!out_begin) {
-        *out_count = src.size();
+        *out_count = (uint32_t)src.size();
         return VK_SUCCESS;
     }
 
@@ -31,25 +31,14 @@ VulkanArrayCopyMeme(const std::vector<T>& src, uint32_t* const out_count, T* con
         res = VK_INCOMPLETE;
     } else {
         res = VK_SUCCESS;
-        *out_count = src.size();
+        *out_count = (uint32_t)src.size();
     }
 
     std::copy_n(src.cbegin(), *out_count, out_begin);
     return res;
 }
 
-template<typename T>
-bool
-SnapshotStruct(T* const dest, const T* const src, const VkStructureType type)
-{
-    const auto srcType = src->sType;
-    if (srcType != type)
-        return false;
-
-    Copy(dest, src);
-    dest->sType = srcType; // Catch racey copies.
-    return true;
-}
+using mutex_guard = std::lock_guard<std::mutex>;
 
 // -------------------------------------
 
@@ -247,41 +236,51 @@ enum class Backends {
 
 // --
 
-class HandleTable;
-
+template<typename DerivedT, typename DerivedHandleT>
 struct MirvObject : public RefCounted
 {
-    friend class HandleTable;
+    typedef DerivedHandleT HandleT;
+    typedef MirvObject<DerivedT,DerivedHandleT> ObjectT;
 
     const MirvObjectType mType;
-private:
-    uint64_t mHandle;
-public:
     mutable std::mutex mMutex;
 
     explicit MirvObject(const MirvObjectType type)
         : mType(type)
-        , mHandle(0)
     { }
 
-    DECL_GETTER(Handle);
+    HandleT Handle() const {
+        return reinterpret_cast<HandleT>(this);
+    }
+
+    static DerivedT* For(const HandleT handle) {
+        ASSERT(handle)
+        return reinterpret_cast<DerivedT*>(handle);
+    }
 };
-
-// --
-
 
 // -------------------------------------
 
 class MirvPhysicalDevice;
 
 class MirvInstance
-    : public MirvObject
+    : public MirvObject<MirvInstance, VkInstance>
 {
-public:
+    static std::mutex gMutex;
+    static std::set<rp<MirvInstance>> gInstances;
+
     std::vector<rp<MirvPhysicalDevice>> mPhysDevs;
 
-    explicit MirvInstance();
+    MirvInstance();
     ~MirvInstance();
+
+public:
+    static VkResult vkCreateInstance(const VkInstanceCreateInfo& createInfo,
+                                     MirvInstance** out);
+    VkResult vkEnumeratePhysicalDevices(VkInstance handle,
+                                        uint32_t* out_physicalDeviceCount,
+                                        MirvPhysicalDevice** out_physicalDevices) const;
+    void vkDestroyInstance();
 
 private:
     template<Backends B>
@@ -293,7 +292,7 @@ private:
 class MirvDevice;
 
 class MirvPhysicalDevice
-    : public MirvObject
+    : public MirvObject<MirvPhysicalDevice, VkPhysicalDevice>
 {
 public:
     MirvInstance& mInstance;
@@ -303,6 +302,8 @@ public:
     std::vector<VkQueueFamilyProperties> mQueueFamilyProperties;
 
 protected:
+    std::set<rp<MirvDevice>> mDevices;
+
     MirvPhysicalDevice(MirvInstance& instance)
         : MirvObject(MirvObjectType::PhysicalDevice)
         , mInstance(instance)
@@ -312,17 +313,21 @@ protected:
         mProperties.apiVersion = VK_API_VERSION_1_0;
     }
 
-public:
     virtual VkResult CreateDevice(const VkDeviceCreateInfo& createInfo,
-                                  rp<MirvDevice>* out_device) = 0;
+                                  rp<MirvDevice>* out) = 0;
+
+public:
+    VkResult vkCreateDevice(const VkDeviceCreateInfo& createInfo,
+                            MirvDevice** out);
 };
 
 // --
 
 class MirvQueue;
+class MirvCommandPool;
 
 class MirvDevice
-    : public MirvObject
+    : public MirvObject<MirvDevice, VkDevice>
 {
 public:
     MirvPhysicalDevice& mPhysDev;
@@ -333,6 +338,12 @@ public:
     ~MirvDevice() override;
 
 public:
+    void vkGetDeviceQueue(uint32_t queueFamilyIndex, uint32_t queueIndex,
+                          MirvQueue** out) const;
+    VkResult vkCreateCommandPool(const VkCommandPoolCreateInfo& createInfo,
+                                 MirvCommandPool** out) const;
+    void vkDestroyDevice() { }
+
     VkResult AddAllQueues(const VkDeviceCreateInfo& info);
 
 protected:
@@ -344,7 +355,7 @@ protected:
 // --
 
 class MirvQueue
-    : public MirvObject
+    : public MirvObject<MirvQueue, VkQueue>
 {
 public:
     MirvDevice& mDevice;
@@ -357,46 +368,24 @@ public:
     { }
 };
 
+// --
+
+class MirvCommandPool
+    : public MirvObject<MirvCommandPool, VkCommandPool>
+{
+};
+
 // -----------------
 
-namespace Handles {
+template<typename T, typename U>
+inline U MapHandle(const rp<T>& x) { return MapHandle(x.get()); }
 
-uint64_t AddT(MirvObject* obj);
-rp<MirvObject> GetT(uint64_t handle, MirvObjectType type);
-rp<MirvObject> RemoveT(uint64_t handle, MirvObjectType type);
-
-#define _(X) \
-inline Vk##X \
-Add(Mirv##X* const obj) \
-{ \
-    return Vk##X(AddT(obj)); \
-} \
-inline rp<Mirv##X> \
-Get(const Vk##X handle) \
-{ \
-    const auto& obj = GetT(uint64_t(handle), MirvObjectType::X); \
-    return static_cast<Mirv##X*>(obj.get()); \
-} \
-inline rp<Mirv##X> \
-Remove(const Vk##X handle) \
-{ \
-    const auto& obj = RemoveT(uint64_t(handle), MirvObjectType::X); \
-    return static_cast<Mirv##X*>(obj.get()); \
-}
-
-_(Instance)
-_(PhysicalDevice)
-_(Device)
-_(Queue)
-
+#define _(X) constexpr X* MapHandle(const X::HandleT h) { return (X*)h; } \
+             constexpr X** MapHandle(X::HandleT* const out_h) { return (X**)out_h; } \
+             constexpr X::HandleT MapHandle(const X* const x) { return (X::HandleT)x; }
+_(MirvInstance)
+_(MirvPhysicalDevice)
+_(MirvDevice)
+_(MirvQueue)
+_(MirvCommandPool)
 #undef _
-
-template<typename T>
-inline rp<T>
-Remove(const T* const obj)
-{
-    const auto& ret = RemoveT(obj);
-    return static_cast<T*>(ret);
-}
-
-} // namespace Handles
